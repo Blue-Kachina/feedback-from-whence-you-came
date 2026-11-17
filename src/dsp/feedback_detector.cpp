@@ -13,6 +13,7 @@ constexpr float kNarrowLowDb = 8.0f, kNarrowHighDb = 20.0f;      // PNPR
 constexpr float kIsolatedLowDb = 6.0f, kIsolatedHighDb = 18.0f;  // PHPR
 constexpr float kDominantLowDb = 6.0f, kDominantHighDb = 16.0f;  // PAPR
 constexpr float kStableLowPct = 0.2f, kStableHighPct = 0.7f;     // frequency spread (inverted)
+constexpr float kMaxExcusedSpreadPct = 1.0f; // runaway growth excuses spread only up to here
 
 // Feature smoothing is asymmetric: evidence against feedback (a harmonic appears, the peak
 // widens) lands within a few frames; evidence for it accumulates slowly. A single clean-looking
@@ -178,10 +179,22 @@ int FeedbackDetector::findPeaks () noexcept
     std::nth_element (scratch_.begin (), scratch_.begin () + count / 2, scratch_.begin () + count);
     const float floorDb = scratch_[static_cast<size_t> (count / 2)];
 
+    // Mean power for PAPR leaves out the main lobes of feedback already detected: once one howl
+    // dominates the spectrum, a second one growing beside it must still read as dominant.
     double meanPower = 0.0;
+    int meanBins = 0;
     for (int b = minBin_; b <= maxBin_; ++b)
+    {
+        bool excluded = false;
+        for (const auto& c : candidates_)
+            excluded = excluded || (c.detected && std::abs (c.frequencyHz / binHz_ - static_cast<float> (b)) <= kMainLobeBins);
+        if (excluded)
+            continue;
         meanPower += std::norm (spectrum_[static_cast<size_t> (b)]);
-    const float meanPowerDb = powerToDb (static_cast<float> (meanPower / static_cast<double> (count))) - normDb_;
+        ++meanBins;
+    }
+    const float meanPowerDb =
+        powerToDb (static_cast<float> (meanPower / static_cast<double> (std::max (1, meanBins)))) - normDb_;
 
     int numPeaks = 0;
     for (int b = minBin_; b <= maxBin_; ++b)
@@ -397,9 +410,11 @@ void FeedbackDetector::updateTrack (int slot, const Peak& peak) noexcept
     const float dominant = smoothstep (kDominantLowDb, kDominantHighDb, c.paprDb);
 
     // Several loop modes growing inside one bin beat against each other and make the frequency
-    // estimate jitter. Sustained steep growth is itself strong evidence, so it excuses instability.
+    // estimate jitter. Sustained steep growth is itself strong evidence, so it excuses some
+    // instability, but not the pitch movement of a voice onset, which grows just as steeply.
     const float runaway =
-        smoothstep (0.5f * config_.fastGrowthDbPerSec, 1.5f * config_.fastGrowthDbPerSec, c.growthDbPerSec);
+        smoothstep (0.5f * config_.fastGrowthDbPerSec, 1.5f * config_.fastGrowthDbPerSec, c.growthDbPerSec) *
+        (1.0f - smoothstep (kStableHighPct, kMaxExcusedSpreadPct, c.frequencySpreadPct));
     const float stable = std::max (runaway, 1.0f - smoothstep (kStableLowPct, kStableHighPct, c.frequencySpreadPct));
 
     // Square root of the product: features near 1 barely lower it, but any one clearly

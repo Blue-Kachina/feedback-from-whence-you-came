@@ -166,6 +166,34 @@ void simultaneousHowls (Checker& check)
     check.expect (low && high, "both howls detected");
 }
 
+// A second howl growing while a first one already dominates the spectrum (as in a real
+// recording: 3.3 kHz howling, then 5.6 kHz joining). The loud one mustn't hide the new one.
+void howlUnderLoudHowl (Checker& check)
+{
+    constexpr double fs = 48000.0;
+    constexpr float startDb = -70.0f, rate = 40.0f;
+    const int n = static_cast<int> (fs * 1.5);
+    Signal s = growingTone (fs, n, 3340.0, -12.0f, 0.0f);
+    s += growingTone (fs, n, 5600.0, startDb, rate);
+    s += whiteNoise (n, startDb);
+
+    const RunResult r = runDetector (s, fs);
+    const Detection* second = nullptr;
+    for (const auto& d : r.detections)
+        if (!second && near (d.frequencyHz, 5600.0, 1.0))
+            second = &d;
+
+    if (!second)
+    {
+        std::printf ("Howl under a -12 dBFS howl: missed\n");
+        check.expect (false, "second howl detected");
+        return;
+    }
+    const float levelDb = startDb + rate * static_cast<float> (second->timeSec);
+    std::printf ("Howl under a -12 dBFS howl: detected at %.0f ms, %.1f dBFS\n", second->timeSec * 1000.0, levelDb);
+    check.expect (levelDb <= -40.0f, "second howl detected before it reaches -40 dBFS");
+}
+
 } // namespace
 
 int main ()
@@ -175,5 +203,6 @@ int main ()
     closedLoop (check);
     closedLoopWithVoice (check);
     simultaneousHowls (check);
+    howlUnderLoudHowl (check);
     return check.finish ("synthetic_feedback");
 }
