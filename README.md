@@ -3,7 +3,8 @@
 A zero-latency VST3 feedback suppressor for karaoke microphones, built on the native
 Steinberg VST3 SDK (3.8.1, MIT) in C++20.
 
-> Status: Phase 1, a mono pass-through shell with a Bypass parameter, state persistence, and 0 samples of reported latency.
+> Status: Phase 2. Feedback detection runs inside the plug-in, but audio still passes through
+> unchanged (notch filtering is Phase 3). Bypass parameter, state persistence, 0 samples of reported latency.
 
 ## Setup (once)
 
@@ -33,6 +34,19 @@ Output: `build\windows-x64\VST3\<Config>\FeedbackFromWhenceYouCame.vst3`
 Steinberg's validator runs after every plug-in build, so validation failures fail the build.
 IDEs that support CMake Presets (Visual Studio, CLion, VS Code) can open the folder directly.
 
+## Analysing recordings
+
+`fwyc_analyze` runs the feedback detector over a WAV file offline, block by block as the
+plug-in would, and reports each detection (when, frequency, level, and the features behind it).
+
+```powershell
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --timeline 100    # top candidates every 100 ms
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --csv frames.csv  # every frame, for plotting
+```
+
+Reads 16/24/32-bit PCM and 32-bit float WAV; multichannel files are averaged unless `--channel N` is given.
+
 ## Layout
 
 | Path | Purpose |
@@ -40,6 +54,7 @@ IDEs that support CMake Presets (Visual Studio, CLion, VS Code) can open the fol
 | `src/dsp/` | Feedback-suppression engine. Standard C++ only, no SDK dependency. |
 | `src/plugin/` | VST3 processor/controller wrapping the engine |
 | `tests/` | Headless DSP tests (CTest) |
+| `tools/` | Offline developer tools (`fwyc_analyze`, WAV reader) |
 | `external/vst3sdk/` | Steinberg SDK, a git submodule pinned to `v3.8.1_build_84` |
 | `cmake/` | Shared CMake config (SDK options, compiler flags) |
 | `.github/workflows/` | Clean-checkout Windows CI build |

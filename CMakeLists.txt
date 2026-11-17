@@ -17,6 +17,9 @@ add_subdirectory(src/dsp)
 # VST3 wrapper around the DSP engine.
 add_subdirectory(src/plugin)
 
+# Offline analysis tools.
+add_subdirectory(tools)
+
 if(FWYC_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

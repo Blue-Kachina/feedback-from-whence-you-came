@@ -1,6 +1,10 @@
 add_library(fwyc_dsp STATIC
+    feedback_detector.cpp
+    feedback_detector.h
     feedback_suppressor.cpp
     feedback_suppressor.h
+    fft.cpp
+    fft.h
 )
 add_library(fwyc::dsp ALIAS fwyc_dsp)
 
