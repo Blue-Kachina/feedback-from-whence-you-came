@@ -1,0 +1,42 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Pinned image (not windows-latest) so toolchain changes are deliberate.
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false # setup.ps1 fetches only the SDK modules the build needs
+
+      # Same bootstrap developers run; on the runner it should find everything preinstalled.
+      # If it has to install something, the image has drifted from .vsconfig.
+      - name: Setup toolchain and SDK
+        shell: pwsh
+        run: ./scripts/setup.ps1
+
+      - name: Build, validate, test
+        shell: pwsh
+        run: ./scripts/build.ps1 -Preset ci -Config Release
+
+      - name: Upload VST3 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: FeedbackFromWhenceYouCame-vst3-windows-x64
+          path: build/ci/VST3/Release/FeedbackFromWhenceYouCame.vst3
+          if-no-files-found: error

@@ -1,0 +1,53 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 (Visual Studio 2022)",
+      "description": "MSVC v143 via the Visual Studio generator; CMake locates the toolchain, no paths are hardcoded.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "toolset": { "value": "v143", "strategy": "set" },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "FWYC_BUILD_TESTS": "ON",
+        "FWYC_WARNINGS_AS_ERRORS": "OFF"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI (Windows x64, warnings as errors)",
+      "inherits": "windows-x64",
+      "cacheVariables": {
+        "FWYC_WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",      "configurePreset": "windows-x64", "configuration": "Debug" },
+    { "name": "release",    "configurePreset": "windows-x64", "configuration": "Release" },
+    { "name": "ci-release", "configurePreset": "ci",          "configuration": "Release" }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "windows-x64",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "ci-release",
+      "configurePreset": "ci",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Build output
+/build/
+/out/
+
+# IDE state (shared settings, if any, can be force-added)
+/.idea/
+/.vs/
+/.vscode/
+CMakeUserPresets.json
