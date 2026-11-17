@@ -5,8 +5,6 @@
 #include "base/source/fstreamer.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 
-#include <algorithm>
-
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
@@ -90,17 +88,12 @@ tresult PLUGIN_API Processor::process (ProcessData& data)
     const float* src = in.channelBuffers32[0];
     float* dst = out.channelBuffers32[0];
 
-    if (bypass_)
-    {
-        if (src != dst)
-            std::copy_n (src, data.numSamples, dst);
-    }
-    else
-    {
-        engine_.process (src, dst, data.numSamples);
-    }
+    // The engine crossfades bypass changes and keeps analysing while bypassed.
+    engine_.setBypassed (bypass_);
+    engine_.process (src, dst, data.numSamples);
 
-    out.silenceFlags = in.silenceFlags;
+    // Notch filters can ring briefly after the input falls silent, so never claim silence.
+    out.silenceFlags = 0;
     return kResultOk;
 }
 

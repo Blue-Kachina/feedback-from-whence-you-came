@@ -1,10 +1,14 @@
-// fwyc_analyze: runs the feedback detector over a WAV file, offline, exactly as the plug-in
-// would see it (block by block), and reports what it detected.
+// fwyc_analyze: runs the full suppressor (detector + notch bank) over a WAV file, offline,
+// exactly as the plug-in would see it (block by block), and reports what it did.
 //
-//   fwyc_analyze <file.wav> [--channel N] [--block N] [--timeline MS] [--csv PATH]
+//   fwyc_analyze <file.wav> [--channel N] [--block N] [--timeline MS] [--csv PATH] [--out PATH]
+//
+// Offline there is no acoustic loop: notching the output doesn't reduce the feedback in the
+// input, so notches deepen to their maximum. The output shows what the notches remove.
 
-#include "dsp/feedback_detector.h"
+#include "dsp/feedback_suppressor.h"
 #include "wav_reader.h"
+#include "wav_writer.h"
 
 #include <algorithm>
 #include <array>
@@ -18,11 +22,13 @@ namespace {
 
 using fwyc::dsp::FeedbackCandidate;
 using fwyc::dsp::FeedbackDetector;
+using fwyc::dsp::FilterBank;
 
 struct Options
 {
     std::string path;
     std::string csvPath;
+    std::string outPath;
     int channel = -1;
     int blockSize = 64;
     double timelineMs = 0.0;
@@ -34,8 +40,9 @@ void printUsage ()
         "usage: fwyc_analyze <file.wav> [options]\n"
         "  --channel N     analyse channel N (0-based) instead of the average of all channels\n"
         "  --block N       host block size in samples (default 64)\n"
-        "  --timeline MS   every MS milliseconds, print input level and the top candidates\n"
-        "  --csv PATH      write every active candidate of every analysis frame to PATH\n");
+        "  --timeline MS   every MS milliseconds, print levels, notches and the top candidates\n"
+        "  --csv PATH      write every active candidate of every analysis frame to PATH\n"
+        "  --out PATH      write the processed audio (32-bit float WAV) to PATH\n");
 }
 
 bool parseArgs (int argc, char** argv, Options& o)
@@ -52,6 +59,8 @@ bool parseArgs (int argc, char** argv, Options& o)
             o.timelineMs = std::atof (argv[++i]);
         else if (arg == "--csv" && hasValue)
             o.csvPath = argv[++i];
+        else if (arg == "--out" && hasValue)
+            o.outPath = argv[++i];
         else if (arg == "-h" || arg == "--help")
             return false;
         else if (!arg.empty () && arg[0] != '-' && o.path.empty ())
@@ -72,12 +81,17 @@ std::string formatTime (double seconds)
     return buf;
 }
 
-float rmsDb (const float* x, int n)
+double sumSquares (const float* x, int n)
 {
     double sum = 0.0;
     for (int i = 0; i < n; ++i)
         sum += static_cast<double> (x[i]) * x[i];
-    return static_cast<float> (10.0 * std::log10 (sum / std::max (1, n) + 1e-20));
+    return sum;
+}
+
+float toDb (double meanSquare)
+{
+    return static_cast<float> (10.0 * std::log10 (meanSquare + 1e-20));
 }
 
 void printFeatures (const FeedbackCandidate& c)
@@ -129,6 +143,16 @@ std::vector<Cluster> clusterEpisodes (const std::vector<Episode>& episodes)
     return clusters;
 }
 
+// One notch slot's lifetime, for the summary.
+struct NotchLife
+{
+    double engaged;
+    double freed;
+    float frequencyHz;
+    float maxDepthDb;
+    int episodes;
+};
+
 } // namespace
 
 int main (int argc, char** argv)
@@ -148,8 +172,10 @@ int main (int argc, char** argv)
         return 1;
     }
 
-    FeedbackDetector detector;
-    detector.prepare (wav.sampleRate);
+    fwyc::dsp::FeedbackSuppressor engine;
+    engine.prepare (wav.sampleRate, opt.blockSize);
+    const auto& detector = engine.detector ();
+    const auto& bank = engine.filterBank ();
 
     const double fs = wav.sampleRate;
     const int total = static_cast<int> (wav.samples.size ());
@@ -157,8 +183,9 @@ int main (int argc, char** argv)
                  wav.isFloat ? "float" : "PCM", wav.channels, wav.channels == 1 ? "" : "s",
                  opt.channel < 0 ? "averaged" : ("channel " + std::to_string (opt.channel)).c_str (),
                  formatTime (total / fs).c_str ());
-    std::printf ("  FFT %d, hop %d (%.2f ms), block %d\n\n", detector.fftSize (), detector.hopSize (),
-                 1000.0 / detector.frameRate (), opt.blockSize);
+    std::printf ("  FFT %d, hop %d (%.2f ms), block %d, %d notches (Q %.0f, %.0f..%.0f dB)\n\n", detector.fftSize (),
+                 detector.hopSize (), 1000.0 / detector.frameRate (), opt.blockSize, FilterBank::kMaxFilters,
+                 bank.config ().q, bank.config ().initialDepthDb, bank.config ().maxDepthDb);
 
     FILE* csv = nullptr;
     if (!opt.csvPath.empty ())
@@ -173,9 +200,20 @@ int main (int argc, char** argv)
                            "spread_pct,growth_db_per_s\n");
     }
 
+    std::vector<float> output (wav.samples.size ());
+
     std::array<bool, FeedbackDetector::kMaxCandidates> wasDetected {};
     std::array<Episode, FeedbackDetector::kMaxCandidates> open {};
     std::vector<Episode> episodes;
+
+    std::array<bool, FilterBank::kMaxFilters> notchInUse {};
+    std::array<float, FilterBank::kMaxFilters> notchTarget {};
+    std::array<NotchLife, FilterBank::kMaxFilters> notchOpen {};
+    std::vector<NotchLife> notches;
+
+    // Level of input vs output while any feedback is detected.
+    double feedbackIn = 0.0, feedbackOut = 0.0, allIn = 0.0, allOut = 0.0;
+    long long feedbackSamples = 0;
 
     const int hop = detector.hopSize ();
     const int timelineEvery =
@@ -183,16 +221,16 @@ int main (int argc, char** argv)
     int nextTimeline = timelineEvery;
     int samplesToCsvFrame = hop;
 
-    std::printf ("Detections\n");
+    std::printf ("Events\n");
     for (int pos = 0; pos < total; pos += opt.blockSize)
     {
-        // Feed in hop-aligned pieces so CSV rows line up with analysis frames; detection is
+        // Feed in hop-aligned pieces so CSV rows line up with analysis frames; processing is
         // unaffected by how the block is split.
         const int blockEnd = std::min (pos + opt.blockSize, total);
         for (int p = pos; p < blockEnd;)
         {
             const int n = std::min (blockEnd - p, samplesToCsvFrame);
-            detector.process (wav.samples.data () + p, n);
+            engine.process (wav.samples.data () + p, output.data () + p, n);
             p += n;
             samplesToCsvFrame -= n;
             if (samplesToCsvFrame == 0)
@@ -214,14 +252,22 @@ int main (int argc, char** argv)
         }
 
         const double now = blockEnd / fs;
+        const int len = blockEnd - pos;
+        const double blockIn = sumSquares (wav.samples.data () + pos, len);
+        const double blockOut = sumSquares (output.data () + pos, len);
+        allIn += blockIn;
+        allOut += blockOut;
+
         const auto& cands = detector.candidates ();
+        bool anyDetected = false;
         for (size_t s = 0; s < cands.size (); ++s)
         {
             const auto& c = cands[s];
+            anyDetected = anyDetected || c.detected;
             if (c.detected && !wasDetected[s])
             {
                 open[s] = {now, now, c.frequencyHz, c.levelDb};
-                std::printf ("  %s  ON   ", formatTime (now).c_str ());
+                std::printf ("  %s  DETECT   ", formatTime (now).c_str ());
                 printFeatures (c);
                 std::printf ("\n");
             }
@@ -234,15 +280,62 @@ int main (int argc, char** argv)
             {
                 open[s].end = now;
                 episodes.push_back (open[s]);
-                std::printf ("  %s  OFF  %8.1f Hz after %.2f s\n", formatTime (now).c_str (), open[s].frequencyHz,
-                             now - open[s].start);
+                std::printf ("  %s  RELEASE  %8.1f Hz after %.2f s\n", formatTime (now).c_str (),
+                             open[s].frequencyHz, now - open[s].start);
             }
             wasDetected[s] = c.detected;
+        }
+        if (anyDetected)
+        {
+            feedbackIn += blockIn;
+            feedbackOut += blockOut;
+            feedbackSamples += len;
+        }
+
+        const auto& slots = bank.slots ();
+        for (size_t s = 0; s < slots.size (); ++s)
+        {
+            const auto& slot = slots[s];
+            if (slot.inUse && !notchInUse[s])
+            {
+                notchOpen[s] = {now, now, slot.frequencyHz, slot.targetDepthDb, slot.episodes};
+                notchTarget[s] = slot.targetDepthDb;
+                std::printf ("  %s  NOTCH+   %8.1f Hz  slot %zu, cut to %.1f dB\n", formatTime (now).c_str (),
+                             slot.frequencyHz, s, slot.targetDepthDb);
+            }
+            else if (slot.inUse)
+            {
+                if (slot.targetDepthDb > notchTarget[s] + 0.01f)
+                    std::printf ("  %s  DEEPER   %8.1f Hz  slot %zu, cut to %.1f dB (floor %.1f, episode %d)\n",
+                                 formatTime (now).c_str (), slot.frequencyHz, s, slot.targetDepthDb, slot.floorDb,
+                                 slot.episodes);
+                notchTarget[s] = slot.targetDepthDb;
+                notchOpen[s].frequencyHz = slot.frequencyHz;
+                notchOpen[s].maxDepthDb = std::max (notchOpen[s].maxDepthDb, slot.depthDb);
+                notchOpen[s].episodes = slot.episodes;
+            }
+            else if (notchInUse[s])
+            {
+                notchOpen[s].freed = now;
+                notches.push_back (notchOpen[s]);
+                std::printf ("  %s  NOTCH-   %8.1f Hz  slot %zu released after %.2f s\n", formatTime (now).c_str (),
+                             notchOpen[s].frequencyHz, s, now - notchOpen[s].engaged);
+            }
+            notchInUse[s] = slot.inUse;
         }
 
         if (timelineEvery && blockEnd >= nextTimeline)
         {
             nextTimeline += timelineEvery;
+            const int window = std::min (timelineEvery, blockEnd);
+            const float inDb = toDb (sumSquares (wav.samples.data () + blockEnd - window, window) / window);
+            const float outDb = toDb (sumSquares (output.data () + blockEnd - window, window) / window);
+            std::printf ("  %s  ---      in %6.1f dBFS, out %6.1f dBFS", formatTime (now).c_str (), inDb, outDb);
+            for (const auto& slot : slots)
+                if (slot.inUse)
+                    std::printf ("  [%.0f Hz -%.1f dB]", slot.frequencyHz, slot.depthDb);
+            std::printf ("\n");
+
             std::array<const FeedbackCandidate*, FeedbackDetector::kMaxCandidates> active {};
             size_t numActive = 0;
             for (const auto& c : cands)
@@ -250,13 +343,9 @@ int main (int argc, char** argv)
                     active[numActive++] = &c;
             std::sort (active.begin (), active.begin () + numActive,
                        [] (auto* a, auto* b) { return a->confidence > b->confidence; });
-
-            const int window = std::min (timelineEvery, blockEnd);
-            std::printf ("  %s  ---  input %6.1f dBFS RMS, %zu tracked\n", formatTime (now).c_str (),
-                         rmsDb (wav.samples.data () + blockEnd - window, window), numActive);
             for (size_t i = 0; i < std::min<size_t> (numActive, 3); ++i)
             {
-                std::printf ("                   %s", active[i]->detected ? "* " : "  ");
+                std::printf ("                      %s", active[i]->detected ? "* " : "  ");
                 printFeatures (*active[i]);
                 std::printf ("\n");
             }
@@ -266,11 +355,17 @@ int main (int argc, char** argv)
     for (size_t s = 0; s < wasDetected.size (); ++s)
         if (wasDetected[s])
             episodes.push_back (open[s]);
+    for (size_t s = 0; s < notchInUse.size (); ++s)
+        if (notchInUse[s])
+        {
+            notchOpen[s].freed = total / fs;
+            notches.push_back (notchOpen[s]);
+        }
 
     if (csv)
         std::fclose (csv);
 
-    std::printf ("\nSummary\n");
+    std::printf ("\nDetections\n");
     const auto clusters = clusterEpisodes (episodes);
     if (clusters.empty ())
         std::printf ("  no feedback detected\n");
@@ -278,5 +373,34 @@ int main (int argc, char** argv)
         std::printf ("  %8.1f Hz  first at %s, %d episode%s, %.2f s total, peak %.1f dBFS\n", c.frequencyHz,
                      formatTime (c.firstStart).c_str (), c.episodes, c.episodes == 1 ? "" : "s", c.totalSeconds,
                      c.peakLevelDb);
+
+    std::printf ("\nNotches\n");
+    if (notches.empty ())
+        std::printf ("  none engaged: output is identical to input\n");
+    std::sort (notches.begin (), notches.end (),
+               [] (const NotchLife& a, const NotchLife& b) { return a.engaged < b.engaged; });
+    for (const auto& n : notches)
+        std::printf ("  %8.1f Hz  %s to %s, max cut %.1f dB, %d episode%s\n", n.frequencyHz,
+                     formatTime (n.engaged).c_str (), formatTime (n.freed).c_str (), n.maxDepthDb, n.episodes,
+                     n.episodes == 1 ? "" : "s");
+
+    std::printf ("\nLevels\n");
+    std::printf ("  whole file:          in %6.1f dBFS RMS, out %6.1f dBFS RMS\n", toDb (allIn / total),
+                 toDb (allOut / total));
+    if (feedbackSamples > 0)
+        std::printf ("  while feedback seen: in %6.1f dBFS RMS, out %6.1f dBFS RMS (%.1f dB reduction, %.2f s)\n",
+                     toDb (feedbackIn / feedbackSamples), toDb (feedbackOut / feedbackSamples),
+                     toDb (feedbackIn / feedbackSamples) - toDb (feedbackOut / feedbackSamples),
+                     static_cast<double> (feedbackSamples) / fs);
+
+    if (!opt.outPath.empty ())
+    {
+        if (!fwyc::tools::writeWavFloat (opt.outPath, output, fs, error))
+        {
+            std::printf ("error: %s\n", error.c_str ());
+            return 1;
+        }
+        std::printf ("\nProcessed audio written to %s\n", opt.outPath.c_str ());
+    }
     return 0;
 }

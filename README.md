@@ -3,8 +3,8 @@
 A zero-latency VST3 feedback suppressor for karaoke microphones, built on the native
 Steinberg VST3 SDK (3.8.1, MIT) in C++20.
 
-> Status: Phase 2. Feedback detection runs inside the plug-in, but audio still passes through
-> unchanged (notch filtering is Phase 3). Bypass parameter, state persistence, 0 samples of reported latency.
+> Status: Phase 3. Detected feedback is cut by up to 8 adaptive notch filters; without
+> feedback, audio passes through bit-exact. Bypass (crossfaded), state persistence, 0 samples of reported latency.
 
 ## Setup (once)
 
@@ -36,14 +36,19 @@ IDEs that support CMake Presets (Visual Studio, CLion, VS Code) can open the fol
 
 ## Analysing recordings
 
-`fwyc_analyze` runs the feedback detector over a WAV file offline, block by block as the
-plug-in would, and reports each detection (when, frequency, level, and the features behind it).
+`fwyc_analyze` runs the full suppressor over a WAV file offline, block by block as the
+plug-in would, and reports each detection (when, frequency, level, and the features behind it),
+each notch (engaged, deepened, released), and the level reduction while feedback was present.
 
 ```powershell
 .\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav
-.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --timeline 100    # top candidates every 100 ms
-.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --csv frames.csv  # every frame, for plotting
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --out processed.wav  # listen to the result
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --timeline 100       # levels, notches, candidates
+.\build\windows-x64\bin\Release\fwyc_analyze.exe recording.wav --csv frames.csv     # every frame, for plotting
 ```
+
+A recording has no live acoustic loop, so notches can't make the feedback in it fade and always
+deepen to their maximum. In a room they stop deepening once the feedback starts to decay.
 
 Reads 16/24/32-bit PCM and 32-bit float WAV; multichannel files are averaged unless `--channel N` is given.
 

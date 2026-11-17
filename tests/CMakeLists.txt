@@ -8,6 +8,8 @@ function(fwyc_add_test name)
 endfunction()
 
 fwyc_add_test(passthrough)
+fwyc_add_test(notch_filter)
 fwyc_add_test(synthetic_feedback)
 fwyc_add_test(vocal_false_positives)
+fwyc_add_test(suppression)
 fwyc_add_test(realtime_performance)

@@ -5,6 +5,10 @@ add_library(fwyc_dsp STATIC
     feedback_suppressor.h
     fft.cpp
     fft.h
+    filter_bank.cpp
+    filter_bank.h
+    notch_filter.cpp
+    notch_filter.h
 )
 add_library(fwyc::dsp ALIAS fwyc_dsp)
 

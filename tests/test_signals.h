@@ -143,24 +143,75 @@ struct LoopSpec
     double delaySeconds = 0.02; // speaker -> mic acoustic path
 };
 
-// Closed acoustic loop: mic = source + delayed, band-limited, amplified mic. The speaker
-// saturates (tanh) so the howl levels off instead of growing without bound.
-inline Signal simulateFeedbackLoop (double fs, const Signal& source, const LoopSpec& loop)
+// Closed acoustic loop: mic = source + delayed, band-limited, amplified (processed) mic.
+// `process (in, out, n)` sits between mic and speaker, as the plug-in would, run in blocks
+// no longer than the loop delay. The speaker saturates (tanh) so a howl levels off.
+// Returns the mic signal.
+template <typename Process>
+Signal simulateFeedbackLoop (double fs, const Signal& source, const LoopSpec& loop, Process&& process,
+                             int blockSize = 64)
 {
     const auto delay = static_cast<size_t> (std::lround (loop.delaySeconds * fs));
+    const auto block = std::min (static_cast<size_t> (blockSize), delay);
     std::vector<double> line (delay, 0.0);
     size_t pos = 0;
     BandPass room (fs, loop.resonanceHz, loop.q);
 
     Signal mic (source.size ());
-    for (size_t i = 0; i < source.size (); ++i)
+    std::vector<float> speakerFeed (block);
+    for (size_t start = 0; start < source.size (); start += block)
     {
-        const double m = source[i] + line[pos];
-        mic[i] = static_cast<float> (m);
-        line[pos] = std::tanh (loop.loopGain * room.process (m));
-        pos = (pos + 1) % delay;
+        const size_t n = std::min (block, source.size () - start);
+        for (size_t i = 0; i < n; ++i)
+            mic[start + i] = static_cast<float> (source[start + i] + line[(pos + i) % delay]);
+
+        process (mic.data () + start, speakerFeed.data (), static_cast<int> (n));
+
+        for (size_t i = 0; i < n; ++i)
+            line[(pos + i) % delay] = std::tanh (loop.loopGain * room.process (speakerFeed[i]));
+        pos = (pos + n) % delay;
     }
     return mic;
+}
+
+// Loop with nothing in the path.
+inline Signal simulateFeedbackLoop (double fs, const Signal& source, const LoopSpec& loop)
+{
+    return simulateFeedbackLoop (fs, source, loop,
+                                 [] (const float* in, float* out, int n) { std::copy_n (in, n, out); });
+}
+
+inline float rmsDb (const Signal& s, size_t from, size_t to)
+{
+    double sum = 0.0;
+    for (size_t i = from; i < to; ++i)
+        sum += static_cast<double> (s[i]) * s[i];
+    return static_cast<float> (10.0 * std::log10 (sum / static_cast<double> (std::max<size_t> (1, to - from)) + 1e-20));
+}
+
+inline float peakDb (const Signal& s, size_t from, size_t to)
+{
+    float peak = 0.0f;
+    for (size_t i = from; i < to; ++i)
+        peak = std::max (peak, std::abs (s[i]));
+    return 20.0f * std::log10 (peak + 1e-10f);
+}
+
+// Level of one frequency component (Goertzel), as the peak amplitude of a sine, in dBFS.
+inline float toneLevelDb (const Signal& s, size_t from, size_t to, double fs, double freqHz)
+{
+    const double w = 2.0 * std::numbers::pi * freqHz / fs;
+    const double coeff = 2.0 * std::cos (w);
+    double s1 = 0.0, s2 = 0.0;
+    for (size_t i = from; i < to; ++i)
+    {
+        const double s0 = s[i] + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    const double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    const double amplitude = 2.0 * std::sqrt (std::max (0.0, power)) / static_cast<double> (to - from);
+    return static_cast<float> (20.0 * std::log10 (amplitude + 1e-10));
 }
 
 // Seconds until |signal| first exceeds the given peak level, or -1 if it never does.

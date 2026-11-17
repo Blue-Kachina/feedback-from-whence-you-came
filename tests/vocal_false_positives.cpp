@@ -1,5 +1,7 @@
-// Phase 2 acceptance: sustained singing and ordinary program material are not flagged as feedback.
+// Sustained singing and ordinary program material are not flagged as feedback, and pass
+// through the engine untouched.
 
+#include "dsp/feedback_suppressor.h"
 #include "test_signals.h"
 
 #include <cstdio>
@@ -22,6 +24,14 @@ void expectNoDetections (Checker& check, const std::string& name, Signal signal)
                  name.c_str (), r.maxConfidence, r.maxConfidenceHz, c.pnprDb, c.phprDb, c.paprDb,
                  c.frequencySpreadPct, c.growthDbPerSec, r.detections.empty () ? "" : "<-- DETECTED");
     check.expect (r.detections.empty (), name.c_str ());
+
+    // Through the whole engine, no detection means no notch: the voice is untouched, bit for bit.
+    fwyc::dsp::FeedbackSuppressor engine;
+    engine.prepare (kFs, 64);
+    Signal out (signal.size ());
+    for (int pos = 0; pos < kSamples; pos += 64)
+        engine.process (signal.data () + pos, out.data () + pos, std::min (64, kSamples - pos));
+    check.expect (out == signal, (name + ": engine output bit-exact").c_str ());
 }
 
 } // namespace
