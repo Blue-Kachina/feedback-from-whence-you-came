@@ -1,4 +1,6 @@
 add_library(fwyc_dsp STATIC
+    emergency_gain.cpp
+    emergency_gain.h
     feedback_detector.cpp
     feedback_detector.h
     feedback_suppressor.cpp
@@ -9,6 +11,8 @@ add_library(fwyc_dsp STATIC
     filter_bank.h
     notch_filter.cpp
     notch_filter.h
+    spectrum_analyser.cpp
+    spectrum_analyser.h
 )
 add_library(fwyc::dsp ALIAS fwyc_dsp)
 

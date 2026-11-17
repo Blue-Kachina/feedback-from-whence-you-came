@@ -1,0 +1,4 @@
+file,plugin,kind,feedback,buffer,position,room,notes
+../sample_recordings/WhistleThenFeedback.wav,none,mixed,11.1-11.8;15.7-21.7,64,facing speaker,,whistle 1.0-2.4 s; mic tap ring 11.1 s; sustained feedback 15.7 s
+../sample_recordings/JustPointingMicAtSpeaker.wav,none,feedback,5.5-9.6,64,pointed at speaker,,feedback only
+../sample_recordings/VoicesLoudeningTillFeedback.wav,none,mixed,8.0-11.0;14.0-15.5;17.8-19.5;24.2-26.0;32.8-37.0,64,facing speaker,,voice played in while gain is raised; 33 s is the most common real case

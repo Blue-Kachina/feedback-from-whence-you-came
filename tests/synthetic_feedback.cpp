@@ -43,7 +43,7 @@ void growingTones (Checker& check)
     std::printf ("Growing tones (from %.0f dBFS)\n", kNoiseDb);
     for (double fs : {44100.0, 48000.0, 96000.0})
     {
-        for (double freq : {300.0, 1000.0, 2400.0, 5000.0, 9000.0})
+        for (double freq : {180.0, 300.0, 1000.0, 2400.0, 5000.0, 9000.0})
         {
             for (float rate : {40.0f, 200.0f})
             {
@@ -69,7 +69,18 @@ void growingTones (Checker& check)
                 // 5 Hz floor: at the first detection a low tone is barely above the noise, and
                 // a notch there is tens of Hz wide anyway. The estimate keeps refining while tracked.
                 check.expect (near (d.frequencyHz, freq, 1.0, 5.0), "frequency within max(1%, 5 Hz)");
-                check.expect (toneDb <= -25.0f, "detected before the tone reaches -25 dBFS");
+                // Known limitation, reported but not enforced: below ~250 Hz the 512-point analysis
+                // can't resolve a low voice's harmonics, so a lone tone there needs more evidence
+                // (held low notes are common in karaoke; feedback there on a vocal mic is not).
+                if (freq < 250.0)
+                {
+                    if (toneDb > -25.0f)
+                        std::printf ("    LIMITATION: low tone detected only at %.1f dBFS\n", toneDb);
+                }
+                else
+                {
+                    check.expect (toneDb <= -25.0f, "detected before the tone reaches -25 dBFS");
+                }
                 check.expect (countDetectionsAwayFrom (r, {freq}, 3.0) == 0, "no detections at other frequencies");
             }
         }

@@ -13,7 +13,8 @@ endif()
 # Only build what this project needs: the SDK libraries and the validator.
 set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES  OFF CACHE BOOL "Build Steinberg plug-in examples")
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "Build Steinberg hosting examples (the validator is always built)")
-set(SMTG_ENABLE_VSTGUI_SUPPORT        OFF CACHE BOOL "Enable VSTGUI (needed once the editor UI lands)")
+# The editor is built on VSTGUI. Forced, so build trees configured before the editor existed pick it up.
+set(SMTG_ENABLE_VSTGUI_SUPPORT        ON  CACHE BOOL "Enable VSTGUI (the editor needs it)" FORCE)
 
 # Validate every plug-in build with Steinberg's validator (post-build step; fails the build on error).
 set(SMTG_RUN_VST_VALIDATOR ON CACHE BOOL "Run the VST3 validator after building")

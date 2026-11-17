@@ -134,8 +134,11 @@ void voiceSurvives (Checker& check)
     s += growingTone (kFs, n, 2500.0, -60.0f, 60.0f, -12.0f);
     s += whiteNoise (n, -60.0f);
 
+    // Offline the howl never fades, which would look like a losing notch and engage the
+    // emergency gain; this measures the notches' selectivity, so it runs them alone.
     FeedbackSuppressor engine;
     engine.prepare (kFs, 64);
+    engine.setEmergencyEnabled (false);
     Signal out (s.size ());
     for (int pos = 0; pos < n; pos += 64)
         engine.process (s.data () + pos, out.data () + pos, std::min (64, n - pos));

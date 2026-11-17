@@ -135,12 +135,20 @@ private:
     double x1_ = 0, x2_ = 0, y1_ = 0, y2_ = 0;
 };
 
+struct GainStep
+{
+    double atSeconds;
+    double loopGain;
+};
+
 struct LoopSpec
 {
     double resonanceHz = 2000.0;
     double q = 4.0;
     double loopGain = 1.2;      // > 1 at resonance: the loop is unstable and howls
     double delaySeconds = 0.02; // speaker -> mic acoustic path
+    double secondResonanceHz = 0.0;  // optional second room mode, same q (0 = none)
+    std::vector<GainStep> gainSteps; // optional loop gain changes, in time order (mic moved)
 };
 
 // Closed acoustic loop: mic = source + delayed, band-limited, amplified (processed) mic.
@@ -156,11 +164,17 @@ Signal simulateFeedbackLoop (double fs, const Signal& source, const LoopSpec& lo
     std::vector<double> line (delay, 0.0);
     size_t pos = 0;
     BandPass room (fs, loop.resonanceHz, loop.q);
+    BandPass secondRoom (fs, loop.secondResonanceHz > 0.0 ? loop.secondResonanceHz : loop.resonanceHz, loop.q);
 
     Signal mic (source.size ());
     std::vector<float> speakerFeed (block);
+    double gain = loop.loopGain;
+    size_t nextStep = 0;
     for (size_t start = 0; start < source.size (); start += block)
     {
+        while (nextStep < loop.gainSteps.size () && start / fs >= loop.gainSteps[nextStep].atSeconds)
+            gain = loop.gainSteps[nextStep++].loopGain;
+
         const size_t n = std::min (block, source.size () - start);
         for (size_t i = 0; i < n; ++i)
             mic[start + i] = static_cast<float> (source[start + i] + line[(pos + i) % delay]);
@@ -168,7 +182,12 @@ Signal simulateFeedbackLoop (double fs, const Signal& source, const LoopSpec& lo
         process (mic.data () + start, speakerFeed.data (), static_cast<int> (n));
 
         for (size_t i = 0; i < n; ++i)
-            line[(pos + i) % delay] = std::tanh (loop.loopGain * room.process (speakerFeed[i]));
+        {
+            double y = room.process (speakerFeed[i]);
+            if (loop.secondResonanceHz > 0.0)
+                y += secondRoom.process (speakerFeed[i]);
+            line[(pos + i) % delay] = std::tanh (gain * y);
+        }
         pos = (pos + n) % delay;
     }
     return mic;

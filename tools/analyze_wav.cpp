@@ -1,10 +1,11 @@
-// fwyc_analyze: runs the full suppressor (detector + notch bank) over a WAV file, offline,
-// exactly as the plug-in would see it (block by block), and reports what it did.
+// fwyc_analyze: runs the full suppressor (detector, notch bank, emergency gain) over a WAV
+// file, offline, exactly as the plug-in would see it (block by block), and reports what it did.
 //
 //   fwyc_analyze <file.wav> [--channel N] [--block N] [--timeline MS] [--csv PATH] [--out PATH]
 //
 // Offline there is no acoustic loop: notching the output doesn't reduce the feedback in the
-// input, so notches deepen to their maximum. The output shows what the notches remove.
+// input, so notches deepen to their maximum and sustained feedback looks like a losing notch,
+// which engages the emergency gain. The output shows what would be removed.
 
 #include "dsp/feedback_suppressor.h"
 #include "wav_reader.h"
@@ -29,6 +30,7 @@ struct Options
     std::string path;
     std::string csvPath;
     std::string outPath;
+    std::string jsonPath;
     int channel = -1;
     int blockSize = 64;
     double timelineMs = 0.0;
@@ -42,7 +44,8 @@ void printUsage ()
         "  --block N       host block size in samples (default 64)\n"
         "  --timeline MS   every MS milliseconds, print levels, notches and the top candidates\n"
         "  --csv PATH      write every active candidate of every analysis frame to PATH\n"
-        "  --out PATH      write the processed audio (32-bit float WAV) to PATH\n");
+        "  --out PATH      write the processed audio (32-bit float WAV) to PATH\n"
+        "  --json PATH     write per-episode measurements and the summary to PATH (for scripts/measure.ps1)\n");
 }
 
 bool parseArgs (int argc, char** argv, Options& o)
@@ -61,6 +64,8 @@ bool parseArgs (int argc, char** argv, Options& o)
             o.csvPath = argv[++i];
         else if (arg == "--out" && hasValue)
             o.outPath = argv[++i];
+        else if (arg == "--json" && hasValue)
+            o.jsonPath = argv[++i];
         else if (arg == "-h" || arg == "--help")
             return false;
         else if (!arg.empty () && arg[0] != '-' && o.path.empty ())
@@ -143,6 +148,44 @@ std::vector<Cluster> clusterEpisodes (const std::vector<Episode>& episodes)
     return clusters;
 }
 
+// One detected howl followed from the moment its peak was first tracked until the track ends,
+// for --json. In a live recording of the plug-in's input (the mic), the drop after detection
+// is what the notches achieved in the room.
+struct Measured
+{
+    double bornSeconds;        // peak first tracked (feedback onset as far as the detector can see)
+    double detectSeconds;
+    float frequencyHz;
+    float detectLevelDb;
+    float peakLevelDb;         // highest level from detection on
+    double peakSeconds;
+    double attenuatedSeconds;  // first time 10 dB below that peak; -1 if never
+    bool faded;                // track ended (sank into the noise) before falling 10 dB
+    double endSeconds;
+    bool emergency;            // emergency gain engaged at some point during the episode
+};
+
+std::string jsonString (const std::string& s)
+{
+    std::string out = "\"";
+    for (char ch : s)
+    {
+        if (ch == '"' || ch == '\\')
+            out += '\\';
+        out += ch;
+    }
+    return out + "\"";
+}
+
+std::string jsonTime (double seconds)
+{
+    if (seconds < 0.0)
+        return "null";
+    char buf[32];
+    std::snprintf (buf, sizeof buf, "%.4f", seconds);
+    return buf;
+}
+
 // One notch slot's lifetime, for the summary.
 struct NotchLife
 {
@@ -211,6 +254,17 @@ int main (int argc, char** argv)
     std::array<NotchLife, FilterBank::kMaxFilters> notchOpen {};
     std::vector<NotchLife> notches;
 
+    bool emergencyOn = false;
+    double emergencyStart = 0.0, emergencySeconds = 0.0;
+    float emergencyMaxDb = 0.0f, emergencyPeakDb = 0.0f;
+    int emergencyCount = 0;
+
+    std::array<bool, FeedbackDetector::kMaxCandidates> wasActive {};
+    std::array<double, FeedbackDetector::kMaxCandidates> bornAt {};
+    std::array<bool, FeedbackDetector::kMaxCandidates> measuring {};
+    std::array<Measured, FeedbackDetector::kMaxCandidates> current {};
+    std::vector<Measured> measured;
+
     // Level of input vs output while any feedback is detected.
     double feedbackIn = 0.0, feedbackOut = 0.0, allIn = 0.0, allOut = 0.0;
     long long feedbackSamples = 0;
@@ -224,12 +278,13 @@ int main (int argc, char** argv)
     std::printf ("Events\n");
     for (int pos = 0; pos < total; pos += opt.blockSize)
     {
-        // Feed in hop-aligned pieces so CSV rows line up with analysis frames; processing is
-        // unaffected by how the block is split.
+        // With --csv, feed in hop-aligned pieces so rows line up with analysis frames. That moves
+        // the engine's chunk boundaries slightly, so without --csv each block goes in whole,
+        // exactly as a host with this block size would deliver it.
         const int blockEnd = std::min (pos + opt.blockSize, total);
         for (int p = pos; p < blockEnd;)
         {
-            const int n = std::min (blockEnd - p, samplesToCsvFrame);
+            const int n = csv ? std::min (blockEnd - p, samplesToCsvFrame) : blockEnd - p;
             engine.process (wav.samples.data () + p, output.data () + p, n);
             p += n;
             samplesToCsvFrame -= n;
@@ -259,11 +314,51 @@ int main (int argc, char** argv)
         allOut += blockOut;
 
         const auto& cands = detector.candidates ();
+        const bool emergencyNow = engine.emergency ().reductionDb () > 0.0f;
         bool anyDetected = false;
         for (size_t s = 0; s < cands.size (); ++s)
         {
             const auto& c = cands[s];
             anyDetected = anyDetected || c.detected;
+
+            if (c.active && !wasActive[s])
+                bornAt[s] = now;
+            wasActive[s] = c.active;
+            if (c.detected && !measuring[s])
+            {
+                measuring[s] = true;
+                current[s] = {bornAt[s], now, c.frequencyHz, c.levelDb, c.levelDb, now, -1.0, false, now, false};
+            }
+            if (measuring[s])
+            {
+                auto& m = current[s];
+                m.endSeconds = now;
+                if (c.active)
+                {
+                    m.emergency = m.emergency || emergencyNow;
+                    if (c.levelDb > m.peakLevelDb)
+                    {
+                        // A new peak: attenuation is measured from the highest point reached.
+                        m.peakLevelDb = c.levelDb;
+                        m.peakSeconds = now;
+                        m.attenuatedSeconds = -1.0;
+                    }
+                    else if (m.attenuatedSeconds < 0.0 && c.levelDb <= m.peakLevelDb - 10.0f)
+                    {
+                        m.attenuatedSeconds = now;
+                    }
+                }
+                else
+                {
+                    if (m.attenuatedSeconds < 0.0)
+                    {
+                        m.faded = true;
+                        m.attenuatedSeconds = now;
+                    }
+                    measured.push_back (m);
+                    measuring[s] = false;
+                }
+            }
             if (c.detected && !wasDetected[s])
             {
                 open[s] = {now, now, c.frequencyHz, c.levelDb};
@@ -324,6 +419,29 @@ int main (int argc, char** argv)
             notchInUse[s] = slot.inUse;
         }
 
+        const auto& emergency = engine.emergency ();
+        if (emergency.reductionDb () > 0.0f && !emergencyOn)
+        {
+            const auto& st = bank.status ();
+            emergencyOn = true;
+            emergencyStart = now;
+            emergencyMaxDb = 0.0f;
+            ++emergencyCount;
+            std::printf ("  %s  EMERG+   broadband cut (%s)\n", formatTime (now).c_str (),
+                         st.overflow ? "more feedback than notches"
+                         : st.losing ? "a full-depth notch is losing"
+                                     : "feedback still loud after its notch");
+        }
+        else if (emergency.reductionDb () <= 0.0f && emergencyOn)
+        {
+            emergencyOn = false;
+            emergencySeconds += now - emergencyStart;
+            std::printf ("  %s  EMERG-   after %.2f s, max cut %.1f dB\n", formatTime (now).c_str (),
+                         now - emergencyStart, emergencyMaxDb);
+        }
+        emergencyMaxDb = std::max (emergencyMaxDb, emergency.reductionDb ());
+        emergencyPeakDb = std::max (emergencyPeakDb, emergency.reductionDb ());
+
         if (timelineEvery && blockEnd >= nextTimeline)
         {
             nextTimeline += timelineEvery;
@@ -334,6 +452,8 @@ int main (int argc, char** argv)
             for (const auto& slot : slots)
                 if (slot.inUse)
                     std::printf ("  [%.0f Hz -%.1f dB]", slot.frequencyHz, slot.depthDb);
+            if (emergency.reductionDb () > 0.0f)
+                std::printf ("  [all -%.1f dB]", emergency.reductionDb ());
             std::printf ("\n");
 
             std::array<const FeedbackCandidate*, FeedbackDetector::kMaxCandidates> active {};
@@ -362,6 +482,14 @@ int main (int argc, char** argv)
             notches.push_back (notchOpen[s]);
         }
 
+    if (emergencyOn)
+        emergencySeconds += total / fs - emergencyStart;
+    for (size_t s = 0; s < measuring.size (); ++s)
+        if (measuring[s])
+            measured.push_back (current[s]); // still going at the end of the file
+    std::sort (measured.begin (), measured.end (),
+               [] (const Measured& a, const Measured& b) { return a.detectSeconds < b.detectSeconds; });
+
     if (csv)
         std::fclose (csv);
 
@@ -384,6 +512,13 @@ int main (int argc, char** argv)
                      formatTime (n.engaged).c_str (), formatTime (n.freed).c_str (), n.maxDepthDb, n.episodes,
                      n.episodes == 1 ? "" : "s");
 
+    std::printf ("\nEmergency gain\n");
+    if (emergencyCount == 0)
+        std::printf ("  never engaged\n");
+    else
+        std::printf ("  engaged %d time%s, %.2f s in total\n", emergencyCount, emergencyCount == 1 ? "" : "s",
+                     emergencySeconds);
+
     std::printf ("\nLevels\n");
     std::printf ("  whole file:          in %6.1f dBFS RMS, out %6.1f dBFS RMS\n", toDb (allIn / total),
                  toDb (allOut / total));
@@ -392,6 +527,43 @@ int main (int argc, char** argv)
                      toDb (feedbackIn / feedbackSamples), toDb (feedbackOut / feedbackSamples),
                      toDb (feedbackIn / feedbackSamples) - toDb (feedbackOut / feedbackSamples),
                      static_cast<double> (feedbackSamples) / fs);
+
+    if (!opt.jsonPath.empty ())
+    {
+        FILE* json = std::fopen (opt.jsonPath.c_str (), "w");
+        if (!json)
+        {
+            std::printf ("error: cannot write %s\n", opt.jsonPath.c_str ());
+            return 1;
+        }
+        const double fbIn = feedbackSamples > 0 ? toDb (feedbackIn / feedbackSamples) : -200.0;
+        const double fbOut = feedbackSamples > 0 ? toDb (feedbackOut / feedbackSamples) : -200.0;
+        std::fprintf (json, "{\n  \"file\": %s,\n  \"sampleRate\": %.0f,\n  \"durationSeconds\": %.4f,\n"
+                            "  \"blockSize\": %d,\n",
+                      jsonString (opt.path).c_str (), fs, total / fs, opt.blockSize);
+        std::fprintf (json, "  \"levels\": {\"inRmsDb\": %.2f, \"outRmsDb\": %.2f, \"feedbackSeconds\": %.4f, "
+                            "\"feedbackInRmsDb\": %.2f, \"feedbackOutRmsDb\": %.2f},\n",
+                      toDb (allIn / total), toDb (allOut / total), static_cast<double> (feedbackSamples) / fs, fbIn,
+                      fbOut);
+        std::fprintf (json, "  \"emergency\": {\"engagements\": %d, \"seconds\": %.4f, \"maxReductionDb\": %.2f},\n",
+                      emergencyCount, emergencySeconds, emergencyPeakDb);
+        std::fprintf (json, "  \"episodes\": [");
+        for (size_t i = 0; i < measured.size (); ++i)
+        {
+            const auto& m = measured[i];
+            std::fprintf (json,
+                          "%s\n    {\"frequencyHz\": %.1f, \"bornSeconds\": %s, \"detectSeconds\": %s, "
+                          "\"detectLevelDb\": %.2f, \"peakLevelDb\": %.2f, \"peakSeconds\": %s, "
+                          "\"attenuatedSeconds\": %s, \"faded\": %s, \"endSeconds\": %s, \"emergency\": %s}",
+                          i == 0 ? "" : ",", m.frequencyHz, jsonTime (m.bornSeconds).c_str (),
+                          jsonTime (m.detectSeconds).c_str (), m.detectLevelDb, m.peakLevelDb,
+                          jsonTime (m.peakSeconds).c_str (), jsonTime (m.attenuatedSeconds).c_str (),
+                          m.faded ? "true" : "false", jsonTime (m.endSeconds).c_str (),
+                          m.emergency ? "true" : "false");
+        }
+        std::fprintf (json, "\n  ]\n}\n");
+        std::fclose (json);
+    }
 
     if (!opt.outPath.empty ())
     {

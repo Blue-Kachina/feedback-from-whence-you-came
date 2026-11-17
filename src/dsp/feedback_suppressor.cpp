@@ -10,6 +10,7 @@ void FeedbackSuppressor::prepare (double sampleRate, int maxBlockSize)
     maxBlockSize_ = maxBlockSize;
     detector_.prepare (sampleRate);
     filterBank_.prepare (sampleRate);
+    emergency_.prepare (sampleRate);
     wetStep_ = static_cast<float> (1.0 / (kBypassFadeSeconds * sampleRate));
     reset ();
 }
@@ -18,12 +19,13 @@ void FeedbackSuppressor::reset () noexcept
 {
     detector_.reset ();
     filterBank_.reset ();
-    wet_ = bypassed_ ? 0.0f : 1.0f;
+    emergency_.reset ();
+    wet_ = bypassed_ || detectOnly_ ? 0.0f : 1.0f;
 }
 
 void FeedbackSuppressor::process (const float* in, float* out, int numSamples) noexcept
 {
-    const float wetTarget = bypassed_ ? 0.0f : 1.0f;
+    const float wetTarget = bypassed_ || detectOnly_ ? 0.0f : 1.0f;
 
     for (int pos = 0; pos < numSamples; pos += kChunkSize)
     {
@@ -31,12 +33,16 @@ void FeedbackSuppressor::process (const float* in, float* out, int numSamples) n
 
         // Analyse the chunk before it is (possibly in-place) overwritten.
         detector_.process (in + pos, n);
+        filterBank_.pauseHolds (emergency_.reductionDb () > 0.0f);
         filterBank_.update (detector_.candidates (), n);
+        emergency_.update (filterBank_.status (), n);
+        if (emergency_.triggered ())
+            filterBank_.escalate ();
 
         for (int i = pos; i < pos + n; ++i)
         {
             const float x = in[i];
-            const float y = filterBank_.processSample (x);
+            const float y = emergency_.processSample (filterBank_.processSample (x));
 
             if (wet_ != wetTarget)
                 wet_ = wet_ < wetTarget ? std::min (wetTarget, wet_ + wetStep_) : std::max (wetTarget, wet_ - wetStep_);

@@ -72,6 +72,13 @@ public:
 
     const std::array<FeedbackCandidate, kMaxCandidates>& candidates () const noexcept;
 
+    // Sensitivity control, safe to change between process() calls.
+    void setThresholds (float detect, float release) noexcept
+    {
+        config_.detectThreshold = detect;
+        config_.releaseThreshold = release;
+    }
+
     const FeedbackDetectorConfig& config () const noexcept { return config_; }
     int fftSize () const noexcept { return fftSize_; }
     int hopSize () const noexcept { return hopSize_; }

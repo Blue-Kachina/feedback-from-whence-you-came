@@ -18,6 +18,10 @@ void FilterBank::reset () noexcept
     for (auto& f : filters_)
         f.reset ();
     numActive_ = 0;
+    status_ = {};
+    budgetVictim_ = -1;
+    recovering_ = false;
+    secondsSinceAnyFeedback_ = 0.0f;
 }
 
 void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::kMaxCandidates>& candidates,
@@ -38,6 +42,7 @@ void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::k
         return candidates[static_cast<size_t> (a)].levelDb > candidates[static_cast<size_t> (b)].levelDb;
     });
 
+    status_ = {};
     for (int i = 0; i < count; ++i)
     {
         const auto& c = candidates[static_cast<size_t> (order[static_cast<size_t> (i)])];
@@ -45,7 +50,10 @@ void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::k
         if (index < 0)
             index = allocateSlot ();
         if (index < 0)
-            continue; // every slot is fighting active feedback
+        {
+            status_.overflow = true; // every slot is fighting active feedback
+            continue;
+        }
 
         auto& slot = slots_[static_cast<size_t> (index)];
         auto& st = state_[static_cast<size_t> (index)];
@@ -59,9 +67,32 @@ void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::k
             st.targetFrequencyHz = c.frequencyHz;
             st.growthDbPerSec = c.growthDbPerSec;
             st.levelDb = c.levelDb;
+            slot.levelDb = c.levelDb;
             slot.feedbackPresent = true;
         }
     }
+
+    if (count > 0)
+        secondsSinceAnyFeedback_ = 0.0f;
+    else if (!holdsPaused_)
+        secondsSinceAnyFeedback_ += dt;
+    recovering_ = secondsSinceAnyFeedback_ >= config_.recoverAfterSeconds;
+    // Over budget, the idle notch that has gone longest without feedback gives way first.
+    // Idle doesn't mean unneeded (a notch that is working keeps its feedback away), so only
+    // one at a time.
+    float totalDepth = 0.0f;
+    budgetVictim_ = -1;
+    for (int i = 0; i < kMaxFilters; ++i)
+    {
+        const auto& s = slots_[static_cast<size_t> (i)];
+        totalDepth += s.depthDb;
+        if (s.inUse && !s.feedbackPresent &&
+            (budgetVictim_ < 0 || state_[static_cast<size_t> (i)].secondsSinceSeen >
+                                      state_[static_cast<size_t> (budgetVictim_)].secondsSinceSeen))
+            budgetVictim_ = i;
+    }
+    if (totalDepth <= config_.maxTotalDepthDb)
+        budgetVictim_ = -1;
 
     numActive_ = 0;
     for (int i = 0; i < kMaxFilters; ++i)
@@ -72,6 +103,20 @@ void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::k
         advanceSlot (i, dt);
 
         const auto& slot = slots_[static_cast<size_t> (i)];
+        const auto& st = state_[static_cast<size_t> (i)];
+        status_.totalDepthDb += slot.depthDb;
+        if (slot.feedbackPresent)
+        {
+            status_.losing = status_.losing || st.secondsLosing >= config_.losingSeconds;
+            status_.loudestLevelDb = std::max (status_.loudestLevelDb, st.levelDb);
+            const float outputDb = st.levelDb - slot.depthDb;
+            if (outputDb > status_.loudestOutputDb)
+            {
+                status_.loudestOutputDb = outputDb;
+                status_.loudestGrowthDbPerSec = st.growthDbPerSec;
+            }
+        }
+
         auto& filter = filters_[static_cast<size_t> (i)];
         if (slot.inUse && slot.depthDb > 0.0f)
         {
@@ -83,6 +128,16 @@ void FilterBank::update (const std::array<FeedbackCandidate, FeedbackDetector::k
         {
             filter.reset (); // idle at 0 dB: bypassed entirely, restarts clean
         }
+    }
+}
+
+void FilterBank::escalate () noexcept
+{
+    for (int i = 0; i < kMaxFilters; ++i)
+    {
+        auto& s = slots_[static_cast<size_t> (i)];
+        if (s.inUse && (s.feedbackPresent || state_[static_cast<size_t> (i)].secondsSinceSeen < config_.holdSeconds))
+            s.targetDepthDb = config_.maxDepthDb;
     }
 }
 
@@ -138,7 +193,12 @@ void FilterBank::advanceSlot (int index, float dt) noexcept
         {
             // New episode. Repeat offenders earn a lasting floor.
             ++s.episodes;
-            const float floor = std::min (config_.maxFloorDb, static_cast<float> (s.episodes - 1) * config_.floorStepDb);
+            float otherFloors = 0.0f;
+            for (int i = 0; i < kMaxFilters; ++i)
+                if (i != index)
+                    otherFloors += slots_[static_cast<size_t> (i)].floorDb;
+            const float floor = std::min ({config_.maxFloorDb, static_cast<float> (s.episodes - 1) * config_.floorStepDb,
+                                           config_.maxTotalFloorDb - otherFloors});
             s.floorDb = std::max (s.floorDb, floor);
 
             const float severity = std::clamp ((st.growthDbPerSec - config_.slowGrowthDbPerSec) /
@@ -161,22 +221,43 @@ void FilterBank::advanceSlot (int index, float dt) noexcept
 
         const float glide = 1.0f - std::exp (-dt / config_.glideSeconds);
         s.frequencyHz += glide * (st.targetFrequencyHz - s.frequencyHz);
+
+        const bool atFullDepth = s.depthDb >= config_.maxDepthDb - 0.01f;
+        const bool growing = st.growthDbPerSec > config_.losingGrowthDbPerSec;
+        st.secondsLosing = atFullDepth && growing ? st.secondsLosing + dt : 0.0f;
     }
     else
     {
-        st.secondsSinceSeen += dt;
+        if (!holdsPaused_)
+            st.secondsSinceSeen += dt;
+        st.secondsLosing = 0.0f;
         s.floorDb = std::max (0.0f, s.floorDb - config_.floorReleaseDbPerSecond * dt);
-        if (st.secondsSinceSeen >= config_.holdSeconds)
-            s.targetDepthDb = std::max (s.floorDb, s.targetDepthDb - config_.releaseDbPerSecond * dt);
+        if (index == budgetVictim_)
+        {
+            s.targetDepthDb = std::max (0.0f, s.targetDepthDb - config_.budgetReleaseDbPerSecond * dt);
+            s.floorDb = std::min (s.floorDb, s.targetDepthDb);
+        }
+        else if (st.secondsSinceSeen >= config_.holdSeconds)
+        {
+            const float rate = recovering_ ? config_.recoveryReleaseDbPerSecond : config_.releaseDbPerSecond;
+            s.targetDepthDb = std::max (s.floorDb, s.targetDepthDb - rate * dt);
+        }
     }
     st.wasPresent = s.feedbackPresent;
+    s.secondsEngaged += dt;
 
+    // The depth limit is a user control and may have been lowered.
+    s.targetDepthDb = std::min (s.targetDepthDb, config_.maxDepthDb);
+    s.floorDb = std::min (s.floorDb, config_.maxDepthDb);
+
+    // The target already ramps down at the release rate in force; the depth follows it.
     if (s.depthDb < s.targetDepthDb)
         s.depthDb = std::min (s.targetDepthDb, s.depthDb + config_.attackDbPerSecond * dt);
     else
-        s.depthDb = std::max (s.targetDepthDb, s.depthDb - config_.releaseDbPerSecond * dt);
+        s.depthDb = s.targetDepthDb;
 
-    if (!s.feedbackPresent && st.secondsSinceSeen >= config_.holdSeconds && s.depthDb <= 0.0f && s.floorDb <= 0.0f)
+    const bool released = st.secondsSinceSeen >= config_.holdSeconds || index == budgetVictim_;
+    if (!s.feedbackPresent && released && s.depthDb <= 0.0f && s.floorDb <= 0.0f)
         freeSlot (index);
 }
 

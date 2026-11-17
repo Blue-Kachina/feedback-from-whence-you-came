@@ -40,6 +40,7 @@ constexpr int kNeighbourLastBin = 8;
 // Beating dips can briefly read as -70 dB/s; whistle tails measured -87 to -89 dB/s.
 constexpr float kMaxOnsetDecayDbPerSec = 40.0f;
 constexpr float kHarmonicToleranceBins = 0.5f; // harmonic peak must sit this close to k * f
+constexpr float kUnresolvedIsolationWeight = 0.5f;
 constexpr float kMissDecay = 0.8f;
 constexpr float kNoHarmonicPhprDb = 60.0f;
 
@@ -236,24 +237,20 @@ FeedbackDetector::Peak FeedbackDetector::measurePeak (int bin, float meanPowerDb
     const float exactBin = static_cast<float> (bin) + delta;
     const float levelDb = m - 0.25f * (a - c) * delta;
 
-    // Neighbouring power, excluding the Hann main lobe (+-2 bins) plus one bin of margin, so a
+    // Neighbouring level, excluding the Hann main lobe (+-2 bins) plus one bin of margin, so a
     // tight cluster of loop modes beating around one frequency isn't counted against itself.
+    // The median, not the mean: a second howl a few bins away (a broad resonance splitting
+    // into two) must not make either one look wide.
     const int half = fftSize_ / 2;
-    double neighbourPower = 0.0;
+    std::array<float, 2 * (kNeighbourLastBin - kNeighbourFirstBin + 1)> ring {};
     int neighbours = 0;
     for (int offset = kNeighbourFirstBin; offset <= kNeighbourLastBin; ++offset)
-    {
         for (int b : {bin - offset, bin + offset})
-        {
             if (b >= 1 && b < half)
-            {
-                neighbourPower += std::norm (spectrum_[static_cast<size_t> (b)]);
-                ++neighbours;
-            }
-        }
-    }
-    const float neighbourDb =
-        powerToDb (static_cast<float> (neighbourPower / std::max (1, neighbours))) - normDb_;
+                ring[static_cast<size_t> (neighbours++)] = specDb_[static_cast<size_t> (b)];
+    const auto middle = ring.begin () + neighbours / 2;
+    std::nth_element (ring.begin (), middle, ring.begin () + neighbours);
+    const float neighbourDb = neighbours > 0 ? *middle : -200.0f;
 
     Peak peak;
     peak.frequencyHz = exactBin * binHz_;
@@ -406,7 +403,11 @@ void FeedbackDetector::updateTrack (int slot, const Peak& peak) noexcept
     c.frequencySpreadPct = 100.0f * std::sqrt (t.freqVar) / std::max (1.0f, t.freqMean);
 
     const float narrow = smoothstep (kNarrowLowDb, kNarrowHighDb, c.pnprDb);
-    const float isolated = smoothstep (kIsolatedLowDb, kIsolatedHighDb, c.phprDb);
+    // Below about kMainLobeBins the 2nd harmonic of a low voice merges into the fundamental's
+    // main lobe, so "no harmonics found" proves less there and counts for less.
+    const bool harmonicsResolvable = c.frequencyHz / binHz_ > kMainLobeBins;
+    const float isolated = smoothstep (kIsolatedLowDb, kIsolatedHighDb, c.phprDb) *
+                           (harmonicsResolvable ? 1.0f : kUnresolvedIsolationWeight);
     const float dominant = smoothstep (kDominantLowDb, kDominantHighDb, c.paprDb);
 
     // Several loop modes growing inside one bin beat against each other and make the frequency
